@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 import warnings
+import numba
 
 import numba.cuda as ncu
 import numpy as np
