@@ -17,6 +17,7 @@ def get_qaoa_portfolio_objective(
     objective: str = "expectation",
     precomputed_optimal_bitstrings: np.ndarray | None = None,
     simulator: str = "auto",
+    simulator_kwargs: dict | None = None,      # ← NEW
 ):
     """Return QAOA objective to be minimized
 
@@ -63,10 +64,11 @@ def get_qaoa_portfolio_objective(
     else:
         raise ValueError(f"Unknown ini passed to get_qaoa_portfolio_objective: {ini}, allowed ['dicke']")
 
-    if mixer == "trotter_ring":
+    if mixer in ("trotter_ring", "xy", "swap"):
         pass
     else:
-        raise ValueError(f"Unknown mixer passed to get_qaoa_portfolio_objective: {mixer}, allowed ['trotter_ring']")
+        raise ValueError(f"Unknown mixer passed to get_qaoa_portfolio_objective: {mixer}, allowed ['trotter_ring', 'xy', 'swap']")
+
     if objective == "overlap" and precomputed_optimal_bitstrings is None:
         bf_result = portfolio_brute_force(po_problem, return_bitstring=True)
         precomputed_optimal_bitstrings = bf_result[1].reshape(1, -1)
@@ -106,6 +108,7 @@ def get_qaoa_portfolio_objective(
             parameterization=parameterization,
             objective=objective,
             simulator=simulator,
+            **(simulator_kwargs or {}),        # ← NEW
             mixer="xy",
             initial_state=sv0,
             n_trotters=T,
