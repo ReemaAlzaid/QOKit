@@ -1,53 +1,40 @@
 ###############################################################################
-# // SPDX‑License‑Identifier: Apache‑2.0
-# // Copyright : JP Morgan Chase & Co
+# SPDX-License-Identifier: Apache-2.0
+# Copyright : JP Morgan Chase & Co
 ###############################################################################
 """
-Block‑wise affine quantisation helpers for the CUDA back‑end.
-Matches the public API of the existing C/Python `quant_utils` modules so
-high‑level code stays the same.
-
-Public surface  ───────────────────────────────────────────────────────────────
-    quantise_fp(sv_dev, quant_bits=8, block_size=256, renorm=True)
-        → (q_dev, scales_dev)
-
-    dequantise_fp(q_dev, scales_dev, block_size=256) → sv_dev
-
-When `quant_bits == 32` the helpers bypass quantisation and simply return the
-original state‑vector – convenient for CI and backwards compatibility.
+Block-wise affine quantisation helpers for the CUDA back-end.
+Matches the public API of the existing C/Python `quant_utils` modules.
 """
 from __future__ import annotations
 
 import math
 from typing import Tuple, Optional
 
-import numba.cuda as ncu
 import numpy as np
+import numba
+import numba.cuda as ncu
+from numba import float32   # ← NEW: dtype shorthands
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 # configuration
-# ──────────────────────────────────────────────────────────────────────────────
-
-# 256 complex numbers → 256 * 8  = 2 kB in fp32 → fits easily in shared even on
-# old CC 6.0 devices.  Tweak if your GPU prefers 128‑thread launch.
-_BLOCK = 256
-_SUPPORTED_BITS = {8, 16, 32}  # 32 == no quantisation
+# ─────────────────────────────────────────────────────────────────────────────
+_BLOCK = 256                          # complex numbers per CUDA block
+_SUPPORTED_BITS = {8, 16, 32}         # 32 = no quantisation
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 # kernels (private)
-# ──────────────────────────────────────────────────────────────────────────────
-
-@ncu.jit(device=True)
+# ─────────────────────────────────────────────────────────────────────────────
+@ncu.jit(device=True, inline=True)
 def _abs_val(z):
-    """Return |z| as float32 from complex64 value."""
     return math.sqrt(z.real * z.real + z.imag * z.imag)
 
 
 @ncu.jit
-def _find_absmax_kernel(sv, tmp):  # pragma: no cover – executed on GPU
+def _find_absmax_kernel(sv, tmp):
     """tmp[blockIdx.x] = max(|sv[block]|) using one warp per block."""
-    sm = ncu.shared.array(shape=_BLOCK, dtype=ncu.float32)
+    sh = ncu.shared.array(shape=_BLOCK, dtype=float32)     # FIX
     tid = ncu.threadIdx.x
     bid = ncu.blockIdx.x
     gid = bid * _BLOCK + tid
@@ -55,42 +42,55 @@ def _find_absmax_kernel(sv, tmp):  # pragma: no cover – executed on GPU
     v = 0.0
     if gid < sv.size:
         v = _abs_val(sv[gid])
-    sm[tid] = v
+    sh[tid] = v
     ncu.syncthreads()
 
     stride = _BLOCK // 2
     while stride:
         if tid < stride:
-            sm[tid] = max(sm[tid], sm[tid + stride])
+            sh[tid] = max(sh[tid], sh[tid + stride])
         stride //= 2
         ncu.syncthreads()
 
     if tid == 0:
-        tmp[bid] = sm[0]
+        tmp[bid] = sh[0]
 
 
 @ncu.jit
-def _quantise_kernel(src, dst, scales, inv_scales, qmax):  # pragma: no cover
-    """Store each complex value as int8/16 after affine scaling."""
+def _build_scales_kernel(absmax, scales, inv_scales, qmax):
+    """Per-block scale and 1/scale – replacement for cuda.elementwise()."""
+    i = ncu.grid(1)
+    if i >= absmax.size:
+        return
+    m = absmax[i]
+    s = 0.0 if m == 0.0 else m / qmax
+    scales[i] = s
+    inv_scales[i] = 0.0 if s == 0.0 else 1.0 / s
+
+
+
+@ncu.jit
+def _quantise_kernel(src, dst, scales_inv, qmax):
     tid = ncu.threadIdx.x
     bid = ncu.blockIdx.x
     gid = bid * _BLOCK + tid
     if gid >= src.size:
         return
 
-    s_inv = inv_scales[bid]
+    s_inv = scales_inv[bid]
     if s_inv == 0.0:
-        dst[gid] = 0j  # stays zero
+        dst[gid] = 0j
         return
 
     z = src[gid]
-    re_q = int(max(-qmax, min(qmax, round(z.real * s_inv))))
-    im_q = int(max(-qmax, min(qmax, round(z.imag * s_inv))))
+    q_max = qmax                 # local register
+    re_q = int(max(-q_max, min(q_max, round(z.real * s_inv))))
+    im_q = int(max(-q_max, min(q_max, round(z.imag * s_inv))))
     dst[gid] = complex(re_q, im_q)
 
 
 @ncu.jit
-def _dequantise_kernel(src, dst, scales):  # pragma: no cover
+def _dequantise_kernel(src, dst, scales):
     tid = ncu.threadIdx.x
     bid = ncu.blockIdx.x
     gid = bid * _BLOCK + tid
@@ -101,20 +101,16 @@ def _dequantise_kernel(src, dst, scales):  # pragma: no cover
     dst[gid] = complex(q.real * s, q.imag * s)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 # public helpers
-# ──────────────────────────────────────────────────────────────────────────────
-
+# ─────────────────────────────────────────────────────────────────────────────
 def quantise_fp(
-    sv: "ncu.device_array",  # complex64 array on device
+    sv: "ncu.device_array",            # complex64 state-vector on device
     quant_bits: int = 8,
     block_size: int = _BLOCK,
     renorm: bool = True,
 ) -> Tuple["ncu.device_array", Optional["ncu.device_array"]]:
-    """Return (q_dev, scales_dev) – state‑vector in int8/16 format.
 
-    When *quant_bits* is 32 the call is a no‑op and returns (sv, None).
-    """
     if quant_bits == 32:
         return sv, None
     if quant_bits not in _SUPPORTED_BITS:
@@ -122,38 +118,35 @@ def quantise_fp(
 
     n_blocks = (sv.size + block_size - 1) // block_size
 
-    # 1. find per‑block absmax ────────────────────────────────────────────────
+    # 1. per-block abs-max
     absmax = ncu.device_array(n_blocks, dtype=np.float32)
     _find_absmax_kernel[(n_blocks, block_size)](sv, absmax)
 
-    # 2. build scale & inverse scale vectors
-    qmax = (1 << (quant_bits - 1)) - 1
-    scales = ncu.device_array_like(absmax)
+    # 2. build scale + inverse
+    qmax = np.float32((1 << (quant_bits - 1)) - 1)
+    scales     = ncu.device_array_like(absmax)
     inv_scales = ncu.device_array_like(absmax)
 
-    ncu.elementwise(
-        "float32 m, float32 qmax -> float32 s",
-        "s = (m == 0.0f) ? 0.0f : m / qmax;",
-    )(absmax, np.float32(qmax), scales)
+    threads = 128
+    blocks  = (n_blocks + threads - 1) // threads
+    _build_scales_kernel[(blocks, threads)](absmax, scales, inv_scales, qmax)
 
-    ncu.elementwise(
-        "float32 s -> float32 inv",
-        "inv = (s == 0.0f) ? 0.0f : 1.0f / s;",
-    )(scales, inv_scales)
 
-    # 3. allocate q‑vector (complex int16 – still 4 B per amp at int8) 
-    q_dtype = np.complex64  # store re/im as 2×int32 – simpler for Numba
-    q_dev = ncu.device_array(sv.shape, dtype=q_dtype)
+    # 3. allocate q-vector (complex64: still 8 B per amp – good enough)
+    q_dev = ncu.device_array(sv.shape, dtype=np.complex64)
 
-    # 4. quantise 
-    _quantise_kernel[(n_blocks, block_size)](sv, q_dev, scales, inv_scales, np.float32(qmax))
+    # 4. quantise
+    _quantise_kernel[(n_blocks, block_size)](
+        sv, q_dev, inv_scales, np.float32(qmax)
+    )
 
-    # 5. optional global L2 renorm to keep \|ψ\| ≈ 1 after rounding
+    # 5. optional global L2 renorm
     if renorm:
-        l2 = ncu.device_array(1, dtype=np.float64)
-        ncu.reduce(lambda x, y: x + y, q_dev.real ** 2 + q_dev.imag ** 2, l2)
-        fac = 1.0 / math.sqrt(l2.copy_to_host()[0])
-        ncu.elementwise("complex64 v, float32 f -> complex64 o", "o = v * f;")(q_dev, np.float32(fac))
+        host = q_dev.copy_to_host()
+        fac = np.float32(1.0 / np.linalg.norm(host))
+        ncu.elementwise("complex64 v, float32 f -> complex64 o", "o = v * f;")(
+            q_dev, fac
+        )
 
     return q_dev, scales
 
@@ -163,8 +156,7 @@ def dequantise_fp(
     scales_dev: Optional["ncu.device_array"],
     block_size: int = _BLOCK,
 ):
-    """Return a *new* complex64 array with de‑quantised amplitudes."""
-    if scales_dev is None:  # passthrough when quant_bits == 32
+    if scales_dev is None:
         return q_dev
 
     sv = ncu.device_array(q_dev.shape, dtype=np.complex64)
