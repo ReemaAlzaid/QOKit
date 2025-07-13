@@ -2,12 +2,28 @@
 # // SPDX-License-Identifier: Apache-2.0
 # // Copyright : JP Morgan Chase & Co
 ###############################################################################
+"""
+CUDA back‑end for QOKit (single‑GPU).  This file defines:
+
+* A base‑class ``QAOAFastSimulatorGPUBase`` that adds optional **block‑wise
+  affine quantisation** to the original float32 implementation.
+* Three concrete simulators for the FUR‑based mixers (X, XY‑ring, XY‑complete).
+* **NEW:** a tiny convenience wrapper ``simulate_qaoa(...)`` so user code can
+  simply import one symbol:
+
+    >>> from QOKit.fur.nbcuda.qaoa_simulator import simulate_qaoa
+
+  without manually instantiating the classes.  The wrapper delegates to the
+  correct concrete simulator and keeps the API identical to the C / Python
+  back‑ends – plus the extra ``quant_bits`` keyword.
+"""
 from __future__ import annotations
 
 from collections.abc import Sequence
 import warnings
-import numba
+from typing import Optional, Any
 
+import numba
 import numba.cuda as ncu
 import numpy as np
 
@@ -31,27 +47,13 @@ from .utils import (
     copy,
 )
 
-
-from typing import Any
-
 DeviceArray = numba.cuda.devicearray.DeviceNDArray
 
-
+# ============================================================================
+# Base class with optional quantisation
+# ============================================================================
 class QAOAFastSimulatorGPUBase(QAOAFastSimulatorBase):
-    """
-    Base-class for the CUDA back-end.  Adds optional block-wise affine
-    quantisation identical to the C and Python simulators.
-
-    Parameters
-    ----------
-    quant_bits   : 32  → no quantisation (default)
-                   16  → int16   + fp16 scale per block
-                   8   → int8    + fp16 scale per block
-    block_size   : # amplitudes in one quantisation block (default 256)
-    renorm       : L2-renormalise after quantising (keeps ∥ψ∥≈1)
-    quant_mode   : "wrapper"  – de/quantise around each layer (safe)
-                   "full"     – use fused kernels (after you add them)
-    """
+    """CUDA single‑GPU simulator with optional int8 / int16 block quantisation."""
 
     def __init__(
         self,
@@ -62,7 +64,7 @@ class QAOAFastSimulatorGPUBase(QAOAFastSimulatorBase):
         quant_bits: int = 32,
         block_size: int = 256,
         renorm: bool = True,
-        quant_mode: str = "wrapper",
+        quant_mode: str = "wrapper",  # "full" once fused kernels land
     ) -> None:
         super().__init__(n_qubits, costs, terms)
 
@@ -71,18 +73,14 @@ class QAOAFastSimulatorGPUBase(QAOAFastSimulatorBase):
         self.renorm = renorm
         self.quant_mode = quant_mode.lower()
 
-        # state-vector lives on device; default dtype = complex64
-        self._sv_device: DeviceArray = ncu.device_array(
-            self.n_states, dtype=np.complex64
-        )
+        # state-vector lives on device
+        self._sv_device: DeviceArray = ncu.device_array(self.n_states, dtype=np.complex128)   # ← use 16-byte elements
 
-        # buffers used only when quant_mode == "wrapper"
+        # quant buffers (used only in wrapper‑mode)
         self._q_sv: Optional[DeviceArray] = None
         self._q_scales: Optional[DeviceArray] = None
 
-    # ───────────────────────────────────────────────────────────────────
-    # diagonal helpers (cost pre-computation stays unchanged)
-    # ───────────────────────────────────────────────────────────────────
+    # ------------------------------------------------------------------ cost diagonal helpers
     def _diag_from_costs(self, costs: CostsType) -> DeviceArray:
         return ncu.to_device(costs)
 
@@ -91,13 +89,11 @@ class QAOAFastSimulatorGPUBase(QAOAFastSimulatorBase):
         precompute_gpu(0, self.n_qubits, terms, out)
         return out
 
-    # ───────────────────────────────────────────────────────────────────
-    # quantisation helpers (no-op when quant_bits == 32 or full mode)
-    # ───────────────────────────────────────────────────────────────────
+    # ------------------------------------------------------------------ quant helpers
     def _maybe_quantise(self) -> None:
         if self.quant_bits == 32 or self.quant_mode != "wrapper":
             return
-        from .quant_utils_gpu import quantise_fp  # local import
+        from .quant_utils_gpu import quantise_fp
 
         self._q_sv, self._q_scales = quantise_fp(
             self._sv_device,
@@ -110,33 +106,30 @@ class QAOAFastSimulatorGPUBase(QAOAFastSimulatorBase):
         if (
             self.quant_bits == 32
             or self.quant_mode != "wrapper"
-            or self._q_sv is None          # ← guard: nothing to de-quant yet
+            or self._q_sv is None
         ):
             return
         from .quant_utils_gpu import dequantise_fp
+
         self._sv_device = dequantise_fp(
             self._q_sv,
             self._q_scales,
             self.block_size,
         )
 
-
-    # ───────────────────────────────────────────────────────────────────
-    # initialise / I/O
-    # ───────────────────────────────────────────────────────────────────
+    # ------------------------------------------------------------------ init / I‑O
     def _initialize(self, sv0: np.ndarray | None = None) -> None:
         if sv0 is None:
             initialize_uniform(self._sv_device)
         else:
             ncu.to_device(np.asarray(sv0, dtype=np.complex64), to=self._sv_device)
-
-        # fresh run → no quant buffers yet
         self._q_sv = None
         self._q_scales = None
 
-    def get_cost_diagonal(self) -> np.ndarray:  # unchanged
+    def get_cost_diagonal(self) -> np.ndarray:
         return self._hc_diag.copy_to_host()
 
+    # main entry called by wrapper/classes
     def simulate_qaoa(
         self,
         gammas: ParamType,
@@ -148,15 +141,16 @@ class QAOAFastSimulatorGPUBase(QAOAFastSimulatorBase):
         self._apply_qaoa(list(gammas), list(betas), **kwargs)
         return self._sv_device if self.quant_mode == "full" else self._q_sv or self._sv_device
 
+    # ------------------------------------------------------------------ measurement helpers (unchanged from original implementation)
     def get_statevector(self, result: DeviceArray, **kwargs) -> np.ndarray:
         return result.copy_to_host()
 
     def get_probabilities(self, result: DeviceArray, **kwargs) -> np.ndarray:
-        preserve_state = kwargs.get("preserve_state", True)
-        if preserve_state:
-            result_orig = result
-            result = ncu.device_array_like(result_orig)
-            copy(result, result_orig)
+        preserve = kwargs.get("preserve_state", True)
+        if preserve:
+            result_copy = ncu.device_array_like(result)
+            copy(result_copy, result)
+            result = result_copy
         norm_squared(result)
         return result.copy_to_host().real
 
@@ -164,96 +158,87 @@ class QAOAFastSimulatorGPUBase(QAOAFastSimulatorBase):
         self,
         result: DeviceArray,
         costs: DeviceArray | np.ndarray | None = None,
-        optimization_type="min",
+        optimization_type: str = "min",
         **kwargs,
     ) -> float:
-        if costs is None:
-            costs = self._hc_diag
-        else:
-            costs = self._diag_from_costs(costs)
-
-        preserve_state = kwargs.get("preserve_state", True)
-        if preserve_state:
-            result_orig = result
-            result = ncu.device_array_like(result_orig)
-            copy(result, result_orig)
-
+        costs_device = self._hc_diag if costs is None else self._diag_from_costs(costs)
+        preserve = kwargs.get("preserve_state", True)
+        if preserve:
+            result_copy = ncu.device_array_like(result)
+            copy(result_copy, result)
+            result = result_copy
         norm_squared(result)
-        multiply(result, costs)
-
-        if optimization_type == "max":
-            return -1 * sum_reduce(result).real
-        return sum_reduce(result).real
+        multiply(result, costs_device)
+        val = sum_reduce(result).real
+        return -val if optimization_type == "max" else val
 
     def get_overlap(
         self,
         result: DeviceArray,
         costs: CostsType | None = None,
         indices: np.ndarray | Sequence[int] | None = None,
-        optimization_type="min",
+        optimization_type: str = "min",
         **kwargs,
     ) -> float:
         try:
             import cupy as cp
         except ImportError:
-            warnings.warn(
-                "Cupy import failed; overlap calculation may be slower.", RuntimeWarning
-            )
+            warnings.warn("cupy not found – overlap slower.", RuntimeWarning)
             import numpy as cp
 
-        probs = self.get_probabilities(result, **kwargs)
-        probs = cp.asarray(probs)
-
+        probs = cp.asarray(self.get_probabilities(result, **kwargs))
         if indices is None:
-            costs_t = self._hc_diag if costs is None else self._diag_from_costs(costs)
-            costs_t = cp.asarray(costs_t)
-            val = costs_t.max() if optimization_type == "max" else costs_t.min()
-            indices_sel = costs_t == val
-        else:
-            indices_sel = indices
+            costs_vec = cp.asarray(self._hc_diag if costs is None else self._diag_from_costs(costs))
+            target_val = costs_vec.max() if optimization_type == "max" else costs_vec.min()
+            indices = costs_vec == target_val
+        return probs[indices].sum().item()
 
-        return probs[indices_sel].sum().item()
-
-    # ───────────────────────────────────────────────────────────────────
-    # subclasses fill in _apply_qaoa
-    # ───────────────────────────────────────────────────────────────────
+    # ------------------------------------------------------------------ virtual – concrete subclasses implement
     def _apply_qaoa(self, gammas: Sequence[float], betas: Sequence[float], **kwargs):
         raise NotImplementedError
 
-
 # ============================================================================
-# concrete simulators – only change is the two helper calls per layer
+# Concrete mixers (FUR‑X, XY‑ring, XY‑complete)
 # ============================================================================
-
-
 class QAOAFURXSimulatorGPU(QAOAFastSimulatorGPUBase):
     def _apply_qaoa(self, gammas: Sequence[float], betas: Sequence[float], **kwargs):
         self._maybe_dequantise()
-        apply_qaoa_furx(
-            self._sv_device, gammas, betas, self._hc_diag, self.n_qubits
-        )
+        apply_qaoa_furx(self._sv_device, gammas, betas, self._hc_diag, self.n_qubits)
         self._maybe_quantise()
-
 
 class QAOAFURXYRingSimulatorGPU(QAOAFastSimulatorGPUBase):
     def _apply_qaoa(self, gammas: Sequence[float], betas: Sequence[float], **kwargs):
         n_trotters = kwargs.get("n_trotters", 1)
         self._maybe_dequantise()
         apply_qaoa_furxy_ring(
-            self._sv_device,
-            gammas,
-            betas,
-            self._hc_diag,
-            self.n_qubits,
-            n_trotters=n_trotters,
+            self._sv_device, gammas, betas, self._hc_diag, self.n_qubits, n_trotters=n_trotters
         )
         self._maybe_quantise()
 
-
 class QAOAFURXYCompleteSimulatorGPU(QAOAFastSimulatorGPUBase):
-    def _apply_qaoa(self, gammas: Sequence[float], betas: Sequence[float], **kwargs):
+    """FUR‑based XY‑complete mixer U(β) = exp(-i β/4 Σ_{j<k} (X_j X_k + Y_j Y_k)).
+
+    Parameters forwarded from the base‑class.  Only the `_apply_qaoa` body is
+    mixer‑specific.
+    """
+
+    def _apply_qaoa(
+        self,
+        gammas: Sequence[float],
+        betas: Sequence[float],
+        **kwargs,
+    ) -> None:
+        """Run p alternating layers of
+
+            • phase‑separator   exp(-i γ H_C / 2)
+            • XY‑complete mixer defined above
+
+        The heavy lifting lives in ``apply_qaoa_furxy_complete`` which is a
+        GPU kernel stack.  We only need to handle (de)‑quantisation around the
+        call when `quant_mode == "wrapper"`.
+        """
         n_trotters = kwargs.get("n_trotters", 1)
-        self._maybe_dequantise()
+        self._maybe_dequantise()  # ⇢ fp32 workspace when quantised
         apply_qaoa_furxy_complete(
             self._sv_device,
             gammas,
@@ -262,4 +247,60 @@ class QAOAFURXYCompleteSimulatorGPU(QAOAFastSimulatorGPUBase):
             self.n_qubits,
             n_trotters=n_trotters,
         )
-        self._maybe_quantise()
+        self._maybe_quantise()    # ⇢ back to int8/16 if needed
+
+# ---------------------------------------------------------------------------
+# Convenience wrapper – importable as a *function* for legacy scripts
+# ---------------------------------------------------------------------------
+import numpy as _np
+
+_DEF_BACKENDS = {
+    "furx": QAOAFURXSimulatorGPU,
+    "furxy_ring": QAOAFURXYRingSimulatorGPU,
+    "furxy_complete": QAOAFURXYCompleteSimulatorGPU,
+}
+
+
+def simulate_qaoa(
+    circ: Any,
+    *,
+    depth: int,
+    costs: CostsType | None = None,
+    terms: TermsType | None = None,
+    backend: str = "furx",  # one of _DEF_BACKENDS keys
+    quant_bits: int = 32,
+    gammas: Sequence[float] | None = None,
+    betas: Sequence[float] | None = None,
+    **kwargs,
+):
+    """User‑facing helper so callers don’t need to instantiate classes.
+
+    Parameters
+    ----------
+    circ        : any object with ``num_qubits`` attribute
+    depth       : QAOA depth p (len(gammas) == len(betas) == depth)
+    costs/terms : cost Hamiltonian as in the base API
+    backend     : "furx" (X mixer), "furxy_ring", or "furxy_complete"
+    quant_bits  : 32 | 16 | 8 – block‑wise quantisation precision
+    gammas/ betas : optional explicit parameter lists; if omitted random values
+                    in [0, 1) are used (convenient for smoke tests).
+    """
+    if backend not in _DEF_BACKENDS:
+        raise ValueError(f"backend must be one of {_DEF_BACKENDS.keys()}")
+
+    n = circ.num_qubits
+    sim_cls = _DEF_BACKENDS[backend]
+    sim = sim_cls(
+        n_qubits=n,
+        costs=costs,
+        terms=terms,
+        quant_bits=quant_bits,
+        **kwargs,
+    )
+
+    if gammas is None:
+        gammas = _np.random.rand(depth)
+    if betas is None:
+        betas = _np.random.rand(depth)
+
+    return sim.simulate_qaoa(gammas, betas, **kwargs)

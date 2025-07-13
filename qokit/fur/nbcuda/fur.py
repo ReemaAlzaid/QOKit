@@ -1,138 +1,168 @@
 ###############################################################################
-# // SPDX-License-Identifier: Apache-2.0
-# // Copyright : JP Morgan Chase & Co
+#  SPDX-License-Identifier: Apache-2.0
+#  Copyright : JP Morgan Chase & Co.
 ###############################################################################
+"""
+Crash-proof GPU helpers for fast-unitary-rotation (**FUR**) kernels.
+
+* Single-qubit uniform **Rx** on k-qubit tiles   (CuPy RawKernel, C++17)
+* Two-qubit **XX + YY** ring / complete mixers   (Numba-CUDA)
+
+Main safety features
+--------------------
+1.  Always launch the *bounds-checked* shared-memory kernel
+    ``furx_kernel<>`` – never the warp variant.
+2.  Extra kernel argument ``n_states`` prevents out-of-bounds stores.
+3.  Works with **CuPy** *or* **Numba** device arrays (zero-copy view).
+4.  Optional header search path:
+       ``export CUPY_NVRTC_INCLUDE_DIRS=/usr/include:/some/other/include``
+"""
+
+from __future__ import annotations
+
 import math
-import numba.cuda
-import numpy as np
-from pathlib import Path
-from functools import lru_cache
+import os
 import warnings
+from functools import lru_cache
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import numba.cuda
 
 try:
-    import cupy as cp
-except ImportError:
+    import cupy as cp                      # mandatory for RawKernels
+except ImportError:                       # pragma: no cover
+    cp = None
     if numba.cuda.is_available():
-        warnings.warn("Cupy import failed, which is required for X rotations on NVIDA GPUs", RuntimeWarning)
+        warnings.warn("CuPy not found – GPU kernels disabled.", RuntimeWarning)
 
 
-########################################
-# single-qubit X rotation
-########################################
-@lru_cache
-def get_furx_kernel(k_qubits: int, q_offset: int, state_mask: int):
-    """
-    Generate furx kernel for the specified sub-group size.
-    """
-    if k_qubits > 6:
-        kernel_name = f"furx_kernel<{k_qubits},{q_offset},{state_mask}>"
-    else:
-        kernel_name = f"warp_furx_kernel<{k_qubits},{q_offset}>"
-
-    code = open(Path(__file__).parent / "furx.cu").read()
-    return cp.RawModule(code=code, name_expressions=[kernel_name], options=("-std=c++17",)).get_function(kernel_name)
+# ─────────────────────────────────────────────────────────────────────────────
+# helpers
+# ─────────────────────────────────────────────────────────────────────────────
+def _as_cparray(x: Any) -> "cp.ndarray":
+    """Return *x* as a CuPy view (zero-copy for Numba arrays)."""
+    if isinstance(x, cp.ndarray):
+        return x
+    try:                                   # Numba’s device array implements
+        return cp.asarray(x)               # __cuda_array_interface__
+    except Exception as exc:               # pragma: no cover
+        raise TypeError(
+            "State-vector must be a CuPy ndarray or CUDA device array"
+        ) from exc
 
 
-def furx(sv: np.ndarray, a: float, b: float, k_qubits: int, q_offset: int, state_mask: int):
-    """
-    Apply in-place fast Rx gate exp(-1j * theta * X) on k consequtive qubits to statevector array x.
+def _include_flags() -> tuple[str, ...]:
+    env = os.environ.get("CUPY_NVRTC_INCLUDE_DIRS", "")
+    return tuple(f"-I{p}" for p in env.split(":") if p)
 
-    sv: statevector
-    a: cosine factor
-    b: sine factor
-    k_qubits: number of qubits to process concurrently
-    q_offset: starting qubit number
-    state_mask: mask for indexing
-    """
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1.  Single-qubit Rx kernels
+# ─────────────────────────────────────────────────────────────────────────────
+@lru_cache(maxsize=None)
+def _get_furx_kernel(k_qubits: int, q_offset: int, state_mask: int):
+    """Compile once per (k,q_offset,mask) triple and return RawKernel."""
+    kernel_name = f"furx_kernel<{k_qubits},{q_offset},{state_mask}>"
+
+    src = (Path(__file__).parent / "furx.cu").read_text("utf-8")
+    src = src.encode("utf-8", "ignore").decode("ascii", "ignore")  # strip UTF-8 art
+
+    mod = cp.RawModule(
+        code=src,
+        name_expressions=[kernel_name],
+        options=("-std=c++17", *_include_flags()),
+    )
+    return mod.get_function(kernel_name)
+
+
+def _launch_furx(
+    d_sv: "cp.ndarray | numba.cuda.cudadrv.devicearray.DeviceNDArray",
+    cos_: float,
+    sin_: float,
+    k_qubits: int,
+    q_offset: int,
+    state_mask: int,
+):
+    """Shared-memory FUR-Rx kernel (bounds-checked, never crashes)."""
+    # convert Numba device array -> CuPy view (zero-copy)
+    if not isinstance(d_sv, cp.ndarray):
+        d_sv = cp.asarray(d_sv)
+
     if k_qubits > 11:
-        raise ValueError("k_qubits should be <= 11 because of shared memory constraints")
+        raise ValueError("k_qubits must be ≤ 11 (shared-memory limit)")
 
-    seq_kernel = get_furx_kernel(k_qubits, q_offset, state_mask)
+    ker = _get_furx_kernel(k_qubits, q_offset, state_mask)
 
-    if k_qubits > 6:
-        threads = 1 << (k_qubits - 1)
-    else:
-        threads = min(32, len(sv))
+    threads = 1 << (k_qubits - 1)               # 2**(k-1)
+    blocks  = (d_sv.size // 2 + threads - 1) // threads
 
-    seq_kernel(((len(sv) // 2 + threads - 1) // threads,), (threads,), (sv, a, b))
+    # EXTRA ARG: total # amplitudes (for the bounds checks inside the kernel)
+    ker((blocks,), (threads,), (d_sv, cos_, sin_, d_sv.size))
 
 
-def furx_all(sv: np.ndarray, theta: float, n_qubits: int):
+def furx_all(d_sv: Any, theta: float, n_qubits: int):
     """
-    Apply in-place fast uniform Rx gates exp(-1j * theta * X) to statevector array x.
-
-    sv: statevector
-    theta: rotation angle
-    n_qubits: total number of qubits
+    In-place uniform **Rx(theta)** on every qubit of the GPU state-vector.
     """
-    n_states = len(sv)
-    state_mask = (n_states - 1) >> 1
+    d_sv = _as_cparray(d_sv)
+    mask = (d_sv.size - 1) >> 1
+    c, s = math.cos(theta), -math.sin(theta)
 
-    a, b = math.cos(theta), -math.sin(theta)
+    TILE = 6                                   # always safe (fits 64 threads)
+    full = (n_qubits // TILE) * TILE
+    for q in range(0, full, TILE):
+        _launch_furx(d_sv, c, s, TILE, q, mask)
 
-    group_size = 10
-    last_group_size = n_qubits % group_size
-
-    cp_sv = cp.asarray(sv)
-
-    for q_offset in range(0, n_qubits - last_group_size, group_size):
-        furx(cp_sv, a, b, group_size, q_offset, state_mask)
-
-    if last_group_size > 0:
-        furx(cp_sv, a, b, last_group_size, n_qubits - last_group_size, state_mask)
+    rem = n_qubits - full
+    if rem:
+        _launch_furx(d_sv, c, s, rem, full, mask)
 
 
-########################################
-# two-qubit XX+YY rotation
-########################################
+# backwards-compat old symbol (`furx` was a *kernel* in legacy code)
+furx = _launch_furx
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2.  Two-qubit XX + YY mixers  (unchanged)
+# ─────────────────────────────────────────────────────────────────────────────
 @numba.cuda.jit
-def furxy_kernel(x, wa, wb, q1, q2, mask1, mask2, maskm):
-    """CUDA kernel for fast uniform XX + YY rotations"""
+def _furxy_kernel(x, wa, wb, q1, q2, mask1, mask2, maskm):
     n_states = len(x)
     n_groups = n_states // 4
     tid = numba.cuda.grid(1)
-
     if tid < n_groups:
         i0 = (tid & mask1) | ((tid & maskm) << 1) | ((tid & mask2) << 2)
-        ia = i0 | (1 << q1)
-        ib = i0 | (1 << q2)
+        ia, ib = i0 | (1 << q1), i0 | (1 << q2)
         x[ia], x[ib] = wa * x[ia] + wb * x[ib], wb * x[ia] + wa * x[ib]
 
 
-def furxy(x: np.ndarray, theta: float, q1: int, q2: int):
-    """
-    Applies e^{-i theta (XX + YY)} on q1, q2 to statevector x
-    Same as XXPlusYYGate in Qiskit
-    https://qiskit.org/documentation/stubs/qiskit.circuit.library.XXPlusYYGate.html
-    theta: rotation angle
-    """
+def furxy(d_sv: Any, theta: float, q1: int, q2: int):
+    d_sv = _as_cparray(d_sv)
     if q1 > q2:
         q1, q2 = q2, q1
-
-    n_states = len(x)
-
+    n_states = d_sv.size
     mask1 = (1 << q1) - 1
     mask2 = (1 << (q2 - 1)) - 1
     maskm = mask1 ^ mask2
     mask2 ^= (n_states - 1) >> 2
-
-    furxy_kernel.forall(n_states)(x, math.cos(theta), -1j * math.sin(theta), q1, q2, mask1, mask2, maskm)
-
-
-def furxy_ring(x: np.ndarray, theta: float, n_qubits: int):
-    """
-    Applies e^{-i theta (XX + YY)} on all adjacent pairs of qubits (with wrap-around)
-    """
-    for i in range(2):
-        for j in range(i, n_qubits - 1, 2):
-            furxy(x, theta, j, j + 1)
-    furxy(x, theta, 0, n_qubits - 1)
+    _furxy_kernel.forall(n_states)(
+        d_sv, math.cos(theta), -1j * math.sin(theta),
+        q1, q2, mask1, mask2, maskm
+    )
 
 
-def furxy_complete(x: np.ndarray, theta: float, n_qubits: int):
-    """
-    Applies e^{-i theta (XX + YY)} on all pairs of qubits
-    """
+def furxy_ring(d_sv: Any, theta: float, n_qubits: int):
+    d_sv = _as_cparray(d_sv)
+    for o in (0, 1):                     # even / odd pairs
+        for q in range(o, n_qubits - 1, 2):
+            furxy(d_sv, theta, q, q + 1)
+    furxy(d_sv, theta, 0, n_qubits - 1)  # wrap-around
+
+
+def furxy_complete(d_sv: Any, theta: float, n_qubits: int):
+    d_sv = _as_cparray(d_sv)
     for i in range(n_qubits - 1):
         for j in range(i + 1, n_qubits):
-            furxy(x, theta, i, j)
+            furxy(d_sv, theta, i, j)
