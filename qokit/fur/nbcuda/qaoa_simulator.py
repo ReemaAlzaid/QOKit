@@ -74,7 +74,8 @@ class QAOAFastSimulatorGPUBase(QAOAFastSimulatorBase):
         self.quant_mode = quant_mode.lower()
 
         # state-vector lives on device
-        self._sv_device: DeviceArray = ncu.device_array(self.n_states, dtype=np.complex128)   # ← use 16-byte elements
+        # self._sv_device: DeviceArray = ncu.device_array(self.n_states, dtype=np.complex128)   # ← use 16-byte elements
+        self._sv_device: DeviceArray = ncu.device_array(self.n_states, dtype=np.complex64)
 
         # quant buffers (used only in wrapper‑mode)
         self._q_sv: Optional[DeviceArray] = None
