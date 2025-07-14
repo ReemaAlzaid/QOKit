@@ -286,3 +286,38 @@ def objective_from_counts(counts, obj):
 def invert_counts(counts):
     """Convert from lsb to msb ordering and vice versa"""
     return {k[::-1]: v for k, v in counts.items()}
+
+
+def classical_warm_start_bitstring(po_problem: dict) -> list[int]:
+    """
+    Very simple greedy: pick the K largest (mean_i / q*Σ_j σ_{ij}) assets.
+    Returns one feasible K-hot bitstring.
+    """
+    N, K, q = po_problem["N"], po_problem["K"], po_problem["q"]
+    means = po_problem["means"]
+    cov_sums = cov_sum = np.sum(po_problem["cov"], axis=1)
+    scores = means / (q * cov_sums + 1e-8)
+    # pick top K highest score
+    picks = np.argsort(scores)[-K:]
+    x = [1 if i in picks else 0 for i in range(N)]
+    return x
+
+def build_terms(N: int, q: float, means: np.array, cov: np.array) -> list[tuple[float, list[int]]]:
+    """
+    Build sparse cost‐Hamiltonian terms list for get_qaoa_objective.
+    Two‐body: ½ q σ_ij Z_i Z_j   (i<j)
+    One‐body: ½ (μ_i − q Σ_j σ_ij) Z_i
+    """
+    terms: list[tuple[float, list[int]]] = []
+    # two‐body
+    for i in range(N-1):
+        for j in range(i+1, N):
+            coeff = 0.5 * q * cov[i, j]
+            if coeff:
+                terms.append((coeff, [i, j]))
+    # one‐body
+    for i in range(N):
+        coeff = 0.5 * (means[i] - q * np.sum(cov[i, :]))
+        if coeff:
+            terms.append((coeff, [i]))
+    return terms

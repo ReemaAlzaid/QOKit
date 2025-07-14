@@ -305,3 +305,24 @@ def simulate_qaoa(
         betas = _np.random.rand(depth)
 
     return sim.simulate_qaoa(gammas, betas, **kwargs)
+
+class QAOASparseSimulatorGPU(QAOAFastSimulatorGPUBase):
+    """
+    Toy sparse‐vector backend using CuPy’s CSR.
+    Only amplitudes present in k-hot subspace stored.
+    """
+    def __init__(self, n_qubits, costs=None, terms=None, *,
+                 quant_bits=32, **kwargs):
+        super().__init__(n_qubits, costs, terms,
+                         quant_bits=quant_bits, **kwargs)
+
+    def _initialize(self, sv0: _np.ndarray | None = None):
+        # override dense initialization with sparse CSR
+        if sv0 is None:
+            raise NotImplementedError("Sparse auto-init not supported")
+        # build a CSR representation on the device
+        data = cuda.to_device(_np.asarray(sv0, dtype=sv0.dtype))
+        idxs = cuda.to_device(_np.nonzero(sv0)[0].astype(_np.int32))
+        self._sv_device = cys.CSR_matrix((data, idxs, ...))
+        self._q_sv = None
+        self._q_scales = None

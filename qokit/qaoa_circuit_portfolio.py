@@ -12,6 +12,33 @@ from .utils import reverse_array_index_bit_order, state_to_ampl_counts
 
 from qiskit.quantum_info import Statevector
 
+# ─── NEW: k-hot & SWAP mixer helpers ─────────────────────────────────────
+from itertools import combinations
+
+def generate_k_hot_superposition(n: int, k: int) -> np.ndarray:
+    """
+    Create a uniform superposition over all bitstrings of Hamming weight k.
+    """
+    idxs = list(combinations(range(n), k))
+    dim  = 2**n
+    state = np.zeros(dim, dtype=complex)
+    amp = 1/np.sqrt(len(idxs))
+    for bits in idxs:
+        index = sum(1 << b for b in bits)
+        state[index] = amp
+    return state
+
+def build_swap_mixer_layer(n_qubits: int, beta_value: float) -> QuantumCircuit:
+    """
+    Build one SWAP‐mixer layer: exp(-i β ∑_{i<j}(X_i X_j + Y_i Y_j)).
+    """
+    qc = QuantumCircuit(n_qubits)
+    for i in range(n_qubits):
+        for j in range(i+1, n_qubits):
+            qc.rxx(2*beta_value, i, j)
+            qc.ryy(2*beta_value, i, j)
+    return qc
+# ────────────────────────────────────────────────────────────────────────────
 
 def generate_dicke_state_fast(N, K):
     """
@@ -124,6 +151,9 @@ def get_qaoa_circuit(
             circuit = get_mixer_Txy(circuit, betas[i], minus=minus, T=T)  # minus should be false
         elif mixer.lower() == "rx":
             circuit = get_mixer_RX(circuit, betas[i])
+        elif mixer.lower() == "swap":
+            # NEW: constraint‐preserving SWAP mixer
+            circuit = build_swap_mixer_layer(N, betas[i]).compose(circuit)
         else:
             raise ValueError("Undefined mixer circuit")
     if save_state is False:
@@ -161,6 +191,8 @@ def get_parameterized_qaoa_circuit(
             circuit = get_mixer_Txy(circuit, betas[i], minus=minus, T=T)  # minus should be false
         elif mixer.lower() == "rx":
             circuit = get_mixer_RX(circuit, betas[i])
+        elif mixer.lower() == "swap":
+            circuit = build_swap_mixer_layer(N, betas[i]).compose(circuit)
         else:
             raise ValueError("Undefined mixer circuit")
     if save_state is False:

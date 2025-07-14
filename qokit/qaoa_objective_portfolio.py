@@ -1,6 +1,6 @@
 from __future__ import annotations
 import numpy as np
-from .utils import precompute_energies, reverse_array_index_bit_order
+from .utils import precompute_energies, reverse_array_index_bit_order, classical_warm_start_bitstring, build_terms
 from .portfolio_optimization import get_configuration_cost_kw, po_obj_func, portfolio_brute_force
 from qokit.qaoa_circuit_portfolio import generate_dicke_state_fast, get_parameterized_qaoa_circuit
 from .qaoa_objective import get_qaoa_objective
@@ -10,14 +10,16 @@ def get_qaoa_portfolio_objective(
     po_problem: dict,
     p: int,
     ini: str = "dicke",
-    mixer: str = "trotter_ring",
+    mixer: str | None = "trotter_ring",
     T: int = 1,
     precomputed_energies: np.ndarray | None = None,
     parameterization: str = "theta",
     objective: str = "expectation",
     precomputed_optimal_bitstrings: np.ndarray | None = None,
     simulator: str = "auto",
-    simulator_kwargs: dict | None = None,      # ← NEW
+    simulator_kwargs: dict | None = None,      # ← NEW: pass quant_bits, dtype, etc.
+    k_hot: str | None = None,
+
 ):
     """Return QAOA objective to be minimized
 
@@ -50,7 +52,10 @@ def get_qaoa_portfolio_objective(
         Function returning the negative of expected value of QAOA with parameters theta
     """
     N = po_problem["N"]
-    K = po_problem["K"]
+    if k_hot is None:
+        K = po_problem["K"]
+    else:
+        K = int(k_hot)  # k_hot is a string, convert to int
     if precomputed_energies is None:
         po_obj = po_obj_func(po_problem)
         precomputed_energies = reverse_array_index_bit_order(precompute_energies(po_obj, N)).real
@@ -61,13 +66,26 @@ def get_qaoa_portfolio_objective(
 
     if ini == "dicke":
         sv0 = generate_dicke_state_fast(N, K)
+    elif ini == "warm":
+        # classical warm‐start biasing
+        x_star = classical_warm_start_bitstring(po_problem)
+        α = 0.9
+        sv0 = np.ones(2**N, dtype=complex) * ((1-α)/np.sqrt(2**N - 1))
+        idx = sum(b<<i for i,b in enumerate(x_star))
+        sv0[idx] = α
+        sv0 /= np.linalg.norm(sv0)
     else:
-        raise ValueError(f"Unknown ini passed to get_qaoa_portfolio_objective: {ini}, allowed ['dicke']")
+        raise ValueError(f"Unknown ini '{ini}', allowed ['dicke','warm']")
 
     if mixer in ("trotter_ring", "xy", "swap"):
         pass
     else:
         raise ValueError(f"Unknown mixer passed to get_qaoa_portfolio_objective: {mixer}, allowed ['trotter_ring', 'xy', 'swap']")
+
+    if simulator != "qiskit":
+        terms = build_terms(N, po_problem["q"], po_problem["means"], po_problem["cov"])
+    else:
+        terms = None
 
     if objective == "overlap" and precomputed_optimal_bitstrings is None:
         bf_result = portfolio_brute_force(po_problem, return_bitstring=True)
@@ -102,15 +120,17 @@ def get_qaoa_portfolio_objective(
     return scaled_result(
         get_qaoa_objective(
             N=N,
-            precomputed_diagonal_hamiltonian=po_problem["scale"] * precomputed_energies,
-            precomputed_optimal_bitstrings=precomputed_optimal_bitstrings,
+            mixer=mixer,
+            n_trotters=T,
             parameterized_circuit=parameterized_circuit,
             parameterization=parameterization,
             objective=objective,
+            terms=terms,
+            precomputed_diagonal_hamiltonian=po_problem["scale"]*precomputed_energies,
+            precomputed_optimal_bitstrings=precomputed_optimal_bitstrings,
             simulator=simulator,
-            **(simulator_kwargs or {}),        # ← NEW
-            mixer="xy",
+            simulator_kw=simulator_kwargs or {},
             initial_state=sv0,
-            n_trotters=T,
+            k_hot=k_hot
         )
     )

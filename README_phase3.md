@@ -165,3 +165,120 @@ Apache 2.0. See `LICENSE` for details.
 | Restructured citation block                    | Separates upstream, dataset, and fork.                             |
 | Added links & tips call‑outs                   | Improves UX.                                                       |
 
+
+# Phase 3 QAOA Benchmark — Reproducibility & Usability
+
+All of the material below is included in full in `README.md` at the root of this repo.
+
+---
+
+## 1. Environment Setup
+
+A convenience script is provided in `./scripts/setup_phase3.sh`. It will install all dependencies, compile the C simulators, and create a Conda environment named `qokit-phase3`.
+
+```bash
+cd <your-QOKit-fork>
+chmod +x scripts/setup_phase3.sh
+./scripts/setup_phase3.sh
+conda activate qokit-phase3
+```
+
+## 2. Hardware Specifications
+
+| Component    | Example Details                             |
+|--------------|---------------------------------------------|
+| CPU          | Intel® Xeon® Gold 6230 @ 2.1 GHz            |
+| GPU          | NVIDIA A100 (40 GB, Compute Capability 8.0) |
+| RAM          | 128 GiB DDR4                                |
+| OS           | Ubuntu 20.04 LTS                            |
+| CUDA Toolkit | 12.8                                        |
+
+Adjust these values to match your machine.
+
+## 3. Sample Configuration File
+
+You can drive the full sweep via a YAML file at `examples/bench_config.yml`:
+
+```yaml
+# examples/bench_config.yml
+N:       20           # number of assets (qubits)
+K:       5            # cardinality constraint
+depth:   6            # QAOA depth p
+trials:  10           # COBYLA restarts per combo
+ini:     all          # 'dicke', 'warm', or 'all'
+mix:     all          # 'swap', 'xy', or 'all'
+backend: [c, python, gpu]
+quant:   [32, 16, 8]  # precision bits to test
+csv:     phase3.csv   # output CSV
+```
+
+To use it:
+
+```bash
+python examples/benchmark_full.py --config examples/bench_config.yml
+```
+
+## 4. User Guide & Walkthrough
+
+**Clone your fork**
+
+```bash
+git clone https://github.com/your-org/QOKit.git
+cd QOKit
+```
+
+**Install & build**
+
+```bash
+scripts/setup_phase3.sh
+conda activate qokit-phase3
+```
+
+**Inspect the benchmark driver**
+
+Script: `examples/benchmark_full.py`
+
+Accepts either command-line flags or `--config examples/bench_config.yml`
+
+**Run a single setting**
+
+```bash
+python examples/benchmark_full.py \
+  --N 20 --K 5 -p 6 \
+  --ini warm --mix swap \
+  --backend c \
+  --trials 10 \
+  --csv quick.csv
+```
+
+**Run the full sweep (from YAML)**
+
+```bash
+python examples/benchmark_full.py --config examples/bench_config.yml
+```
+
+Results are appended to the specified CSV (default: `full_bench.csv`).
+
+## 5. Quick-Sweep Command
+
+If you prefer flags instead of YAML:
+
+```bash
+python examples/benchmark_full.py \
+  --N 20 --K 5 -p 6 \
+  --ini all --mix all \
+  --backend c python gpu \
+  --trials 10 \
+  --quant 32 16 8 \
+  --csv phase3.csv \
+  --sweep
+```
+
+This will iterate over:
+
+- initializations: dicke, warm
+- mixers: swap, xy
+- back-ends: c, python, gpu
+- quantization: 32, 16, 8
+
+and append each result into `phase3.csv`.
